@@ -35,6 +35,10 @@ import { getMainLoopModel } from '../utils/model/model.js'
 import { hasPermissionsToUseTool } from '../utils/permissions/permissions.js'
 import { setCwd } from '../utils/Shell.js'
 import { jsonStringify } from '../utils/slowOperations.js'
+import {
+  BASH_MAX_OUTPUT_UPPER_LIMIT,
+  getMaxOutputLength,
+} from '../utils/shell/outputLimits.js'
 import { getErrorParts } from '../utils/toolErrors.js'
 import { zodToJsonSchema } from '../utils/zodToJsonSchema.js'
 
@@ -67,6 +71,21 @@ export async function loadReexposedMcpTools(): Promise<{
   })
 
   return { mcpClients, mcpTools }
+}
+
+
+/** Cap MCP CallTool text returned to mill hosts (GB/Cursor). Bash already
+ * truncates stdout via getMaxOutputLength(); this also bounds jsonStringify
+ * of object results and non-Bash tools so post-tool follow-up requests stay
+ * under host/provider payload limits. Override with BASH_MAX_OUTPUT_LENGTH
+ * (stock; default 30000, upper 150000). */
+function truncateMcpToolText(text: string): string {
+  const max = getMaxOutputLength()
+  if (text.length <= max) return text
+  return (
+    text.slice(0, max) +
+    `\n\n... [MCP tool result truncated at ${max} chars; set BASH_MAX_OUTPUT_LENGTH (max ${BASH_MAX_OUTPUT_UPPER_LIMIT}) to raise] ...`
+  )
 }
 
 export async function startMCPServer(
@@ -200,24 +219,24 @@ export async function startMCPServer(
         const data = finalResult.data as string | { type: string; text?: string; source?: { type: string; media_type: string; data: string } }[] | unknown
 
         if (typeof data === 'string') {
-          content = [{ type: 'text', text: data }]
+          content = [{ type: 'text', text: truncateMcpToolText(data) }]
         } else if (Array.isArray(data)) {
           content = data.flatMap((block: unknown) => {
             // Boundary data — defensively skip primitives/null instead of crashing.
             if (!block || typeof block !== 'object') return []
             const b = block as { type?: unknown; text?: unknown; source?: { type?: unknown; media_type?: unknown; data?: unknown } }
             if (b.type === 'text') {
-              return [{ type: 'text', text: String(b.text ?? '') } as CallToolResult['content'][number]]
+              return [{ type: 'text', text: truncateMcpToolText(String(b.text ?? '')) } as CallToolResult['content'][number]]
             }
             if (b.type === 'image' && b.source && typeof b.source.data === 'string' && typeof b.source.media_type === 'string') {
               return [{ type: 'image', data: b.source.data, mimeType: b.source.media_type } as CallToolResult['content'][number]]
             }
             // eslint-disable-next-line custom-rules/no-top-level-side-effects, no-console
             console.warn(`Unmapped content block type from tool ${name}: ${String(b.type ?? 'unknown')}`)
-            return [{ type: 'text', text: jsonStringify(block) } as CallToolResult['content'][number]]
+            return [{ type: 'text', text: truncateMcpToolText(jsonStringify(block)) } as CallToolResult['content'][number]]
           }) as CallToolResult['content']
         } else {
-          content = [{ type: 'text', text: jsonStringify(data) }]
+          content = [{ type: 'text', text: truncateMcpToolText(jsonStringify(data)) }]
         }
 
         return {
